@@ -13,8 +13,14 @@ import re
 import json
 import csv
 
+#Spline fitting
+from scipy import interpolate
+
 #Scheduler
 from apscheduler.schedulers.background import BackgroundScheduler
+
+#Plotting
+import matplotlib.pyplot as plt
 
 #--------------------------------------
 #Interfacing class
@@ -98,8 +104,6 @@ class TemperatureController():
         self.temperaturesMeasuredInternal = []
         self.timesExecuted = []
 
-        #Start time for time keeping subtraction
-        self.startTime = time.time()
 
         #AP scheduler for controller execution
         self.scheduler = BackgroundScheduler()
@@ -112,6 +116,8 @@ class TemperatureController():
 
     def enableController(self):
         self.scheduler.resume()
+        #Start time for time keeping subtraction
+        self.startTime = time.time()
 
     def shutdownController(self):
         self.scheduler.pause()
@@ -140,13 +146,18 @@ class TemperatureController():
         self.timesExecuted.append(time.time()-self.startTime)
 
         print('Time: {}, Setpoint Temperature: {}, Kiln Temperature: {}, Dutycycle: {}'.format(
-            time.time() - self.startTime, self.setpoint, self.interfaceObject.kilnTemperature, dutyCycle))
+            (time.time() - self.startTime)/3600, self.setpoint, self.interfaceObject.kilnTemperature, dutyCycle))
 
 #--------------------------------------
 #Temperature profile class
 #--------------------------------------
 class TemperatureProfile():
-    def __init__(self, controllerObject, temperatureFile):
+    def __init__(self, dt, controllerObject, temperatureFile):
+        self.temperatureFile = temperatureFile
+        self.dt = dt
+
+        self.controllerObject = controllerObject
+
         #Read in temperature profile
         self.temperatureSetpoints = []
         self.timeSetpoints = []
@@ -155,16 +166,72 @@ class TemperatureProfile():
         #Interpolated temperature profile based on dt
         self.temperatureSetpointsInterpolated = []
         self.timeSetpointsInterpolated = []
+        self.fitSpline()
+        self.interpolateProfile()
 
+        #index in profile
+        self.index = 0
+        self.done = False
+
+        #profile executing scheduler
+        self.scheduler = BackgroundScheduler()
+        self.scheduler.start(paused=False)
+        self.scheduler.add_job(self.execute, 'interval', seconds = self.dt)
+
+    def shutdown(self):
+        self.scheduler.pause()
+        self.scheduler.shutdown(wait=True)
 
     def readTemperatureProfile(self):
-        with open('data.txt') as json_file:
+        print('*********************************************************************')
+        print('*********************************************************************')
+        print('Reading temperature profile from JSON: {}'.format(self.temperatureFile))
+        print('*********************************************************************')
+
+        with open(self.temperatureFile) as json_file:
             data = json.load(json_file)
-            for p in data['people']:
-                print('Name: ' + p['name'])
-                print('Website: ' + p['website'])
-                print('From: ' + p['from'])
-                print('')
+            for setpoint in data['setpoints']:
+                temperature = setpoint['temperature']
+                setpointTime = setpoint['time']
+                print('Temperature: {}'.format(temperature))
+                print('Time: {}'.format(setpointTime))
+                self.temperatureSetpoints.append(float(temperature))
+                self.timeSetpoints.append(float(setpointTime))
+            self.temperatureSetpoints = (np.array(self.temperatureSetpoints) - 32) * 5.0 / 9.0
+            self.timeSetpoints = np.array(self.timeSetpoints)
+
+        self.timeCumSum = np.cumsum(self.timeSetpoints)
+        print('Cumulative hours for profile: {}'.format(self.timeCumSum))
+        print('*********************************************************************')
+
+
+    def fitSpline(self):
+        self.f = interpolate.interp1d(self.timeCumSum*3600, self.temperatureSetpoints,
+         kind='linear', fill_value="extrapolate")
+
+    def interpolateProfile(self):
+        self.timeSetpointsInterpolated = np.arange(0, self.timeCumSum[-1]*3600, self.dt)
+        print('Interpolated time (seconds): {}'.format(self.timeSetpointsInterpolated))
+        self.temperatureSetpointsInterpolated = self.f(self.timeSetpointsInterpolated)
+        print('Interpolated temperature (Celsius): {}'.format(self.temperatureSetpointsInterpolated))
+        print('Plotting...')
+        plt.figure()
+        plt.plot(self.timeSetpointsInterpolated/3600, self.temperatureSetpointsInterpolated)
+        plt.xlabel('Time (hours)')
+        plt.ylabel('Temperature (Celsius)')
+        plt.title('Interpolated Profile')
+        plt.show()
+        print('*********************************************************************')
+        print('*********************************************************************')
+
+    def execute(self):
+        if self.index < len(self.timeSetpointsInterpolated):
+            self.controllerObject.updateSetpoint(self.temperatureSetpointsInterpolated[self.index])
+        else:
+            self.done = True
+        self.index += 1
+
+
 
 
 if __name__ == '__main__': 
@@ -174,14 +241,17 @@ if __name__ == '__main__':
     interface = arduinoInterface(dt = dt)
     interface.connectSerial("/dev/ttyACM0")
     controller = TemperatureController(dt = dt, interfaceObject = interface)
+    profile = TemperatureProfile(dt = dt, controllerObject = controller, temperatureFile = 'cone06Glaze.txt')
     controller.enableController()
 
     start=time.time()
 
-    controller.updateSetpoint(460)
-    time.sleep(200)
+    while not profile.done:
+        time.sleep(1)
+
     controller.dumpData('test.csv')
 
+    profile.shutdown()
     controller.shutdownController()
     interface.disconectSerial()
     exit()
